@@ -17,6 +17,9 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
+# Environment variables
+.env
+
 # Debug builds
 /debug/
 /incremental/
