@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug builds
+/debug/
+/incremental/
+
+# Build artifacts
+*.a
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+
+# Added by cargo
+
+/target
