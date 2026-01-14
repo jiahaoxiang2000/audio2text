@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
     let api_key = std::env::var("DASHSCOPE_API_KEY")
         .context("DASHSCOPE_API_KEY environment variable not set")?;
 
-    info!("Audio2Text - Real-time speech recognition");
+    info!("Audio2Text v{} - Real-time speech recognition", env!("CARGO_PKG_VERSION"));
     info!("Will auto-stop after {} seconds of silence (no speech detected).", MAX_SILENCE_SECONDS);
     info!("Press Ctrl+C to stop manually.");
 
