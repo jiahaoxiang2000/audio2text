@@ -1,9 +1,9 @@
 ---
 title: "Audio2Text: Real-Time Speech-to-Text for AI Workflows"
 description: A comprehensive guide to Audio2Text, a real-time Chinese-to-English speech recognition and translation tool that enhances AI-driven development workflows
-date: 2025-12-24
+date: 2026-01-14
 author: isomo
-tags: [audio2text, speech-recognition, translation, rust, ai-workflow, wayland]
+tags: [audio2text, ai-workflow]
 video: ""
 ---
 
