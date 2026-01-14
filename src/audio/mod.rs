@@ -52,7 +52,7 @@ impl AudioCapture {
         let samples_per_chunk = (sample_rate * CHUNK_DURATION_MS / 1000) as usize;
 
         let stream = match sample_format {
-            SampleFormat::I16 => build_stream::<i16>(
+            SampleFormat::I8 => build_stream_i8(
                 &device,
                 &config.into(),
                 audio_tx,
@@ -61,7 +61,7 @@ impl AudioCapture {
                 channels,
                 samples_per_chunk,
             )?,
-            SampleFormat::F32 => build_stream::<f32>(
+            SampleFormat::I16 => build_stream_i16(
                 &device,
                 &config.into(),
                 audio_tx,
@@ -70,7 +70,70 @@ impl AudioCapture {
                 channels,
                 samples_per_chunk,
             )?,
-            SampleFormat::U16 => build_stream::<u16>(
+            SampleFormat::I32 => build_stream_i32(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::I64 => build_stream_i64(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::U8 => build_stream_u8(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::U16 => build_stream_u16(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::U32 => build_stream_u32(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::U64 => build_stream_u64(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::F32 => build_stream_f32(
+                &device,
+                &config.into(),
+                audio_tx,
+                is_recording,
+                sample_rate,
+                channels,
+                samples_per_chunk,
+            )?,
+            SampleFormat::F64 => build_stream_f64(
                 &device,
                 &config.into(),
                 audio_tx,
@@ -147,7 +210,61 @@ fn find_best_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig
         .context("No suitable input config found")
 }
 
-fn build_stream<T>(
+// Helper function to process audio data regardless of type
+fn process_audio_samples(
+    samples_f32: Vec<f32>,
+    source_channels: u16,
+    buffer: &mut Vec<f32>,
+    samples_per_chunk: usize,
+    resampler: &Option<SimpleResampler>,
+    audio_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    // Convert to mono if stereo
+    let mono_samples: Vec<f32> = if source_channels == 2 {
+        samples_f32
+            .chunks(2)
+            .map(|chunk| (chunk[0] + chunk.get(1).copied().unwrap_or(0.0)) / 2.0)
+            .collect()
+    } else if source_channels > 2 {
+        samples_f32
+            .chunks(source_channels as usize)
+            .map(|chunk| chunk.iter().sum::<f32>() / source_channels as f32)
+            .collect()
+    } else {
+        samples_f32
+    };
+
+    buffer.extend(mono_samples);
+
+    // Process complete chunks
+    while buffer.len() >= samples_per_chunk {
+        let chunk: Vec<f32> = buffer.drain(..samples_per_chunk).collect();
+
+        // Resample if necessary
+        let resampled = if let Some(ref resampler) = resampler {
+            resampler.resample(&chunk)
+        } else {
+            chunk
+        };
+
+        // Convert to i16 PCM bytes
+        let pcm_bytes: Vec<u8> = resampled
+            .iter()
+            .flat_map(|&sample| {
+                let clamped = sample.clamp(-1.0, 1.0);
+                let i16_sample = (clamped * 32767.0) as i16;
+                i16_sample.to_le_bytes()
+            })
+            .collect();
+
+        // Send to channel (non-blocking)
+        if let Err(e) = audio_tx.try_send(pcm_bytes) {
+            warn!("Failed to send audio chunk: {}", e);
+        }
+    }
+}
+
+fn build_stream_i8(
     device: &cpal::Device,
     config: &StreamConfig,
     audio_tx: mpsc::Sender<Vec<u8>>,
@@ -155,11 +272,7 @@ fn build_stream<T>(
     source_sample_rate: u32,
     source_channels: u16,
     samples_per_chunk: usize,
-) -> Result<cpal::Stream>
-where
-    T: Sample + cpal::SizedSample + Send + 'static,
-    f32: From<T>,
-{
+) -> Result<cpal::Stream> {
     let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
     let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
         Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
@@ -171,60 +284,438 @@ where
 
     let stream = device.build_input_stream(
         config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
+        move |data: &[i8], _: &cpal::InputCallbackInfo| {
             if !is_recording.load(Ordering::SeqCst) {
                 return;
             }
 
-            // Convert to f32
-            let samples: Vec<f32> = data.iter().map(|&s| f32::from(s)).collect();
+            // Convert i8 to f32 (range -128 to 127)
+            let samples: Vec<f32> = data.iter().map(|&s| s as f32 / 128.0).collect();
 
-            // Convert to mono if stereo
-            let mono_samples: Vec<f32> = if source_channels == 2 {
-                samples
-                    .chunks(2)
-                    .map(|chunk| (chunk[0] + chunk.get(1).copied().unwrap_or(0.0)) / 2.0)
-                    .collect()
-            } else if source_channels > 2 {
-                samples
-                    .chunks(source_channels as usize)
-                    .map(|chunk| chunk.iter().sum::<f32>() / source_channels as f32)
-                    .collect()
-            } else {
-                samples
-            };
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
 
-            buffer.extend(mono_samples);
+    Ok(stream)
+}
 
-            // Process complete chunks
-            let _target_samples_per_chunk =
-                (TARGET_SAMPLE_RATE * CHUNK_DURATION_MS / 1000) as usize;
+fn build_stream_i16(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
 
-            while buffer.len() >= samples_per_chunk {
-                let chunk: Vec<f32> = buffer.drain(..samples_per_chunk).collect();
+    let err_fn = |err| error!("Audio stream error: {}", err);
 
-                // Resample if necessary
-                let resampled = if let Some(ref resampler) = resampler {
-                    resampler.resample(&chunk)
-                } else {
-                    chunk
-                };
-
-                // Convert to i16 PCM bytes
-                let pcm_bytes: Vec<u8> = resampled
-                    .iter()
-                    .flat_map(|&sample| {
-                        let clamped = sample.clamp(-1.0, 1.0);
-                        let i16_sample = (clamped * 32767.0) as i16;
-                        i16_sample.to_le_bytes()
-                    })
-                    .collect();
-
-                // Send to channel (non-blocking)
-                if let Err(e) = audio_tx.try_send(pcm_bytes) {
-                    warn!("Failed to send audio chunk: {}", e);
-                }
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[i16], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
             }
+
+            // Convert i16 to f32 (range -32768 to 32767)
+            let samples: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_i32(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[i32], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert i32 to f32
+            let samples: Vec<f32> = data
+                .iter()
+                .map(|&s| s as f32 / (i32::MAX as f32))
+                .collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_i64(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[i64], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert i64 to f32
+            let samples: Vec<f32> = data
+                .iter()
+                .map(|&s| (s as f64 / i64::MAX as f64) as f32)
+                .collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_u8(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[u8], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert u8 to f32 (range 0 to 255, center at 128)
+            let samples: Vec<f32> = data
+                .iter()
+                .map(|&s| (s as f32 - 128.0) / 128.0)
+                .collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_u16(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[u16], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert u16 to f32 (range 0 to 65535, center at 32768)
+            let samples: Vec<f32> = data
+                .iter()
+                .map(|&s| (s as f32 - 32768.0) / 32768.0)
+                .collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_u32(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[u32], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert u32 to f32
+            let samples: Vec<f32> = data
+                .iter()
+                .map(|&s| ((s as f64 - (u32::MAX as f64 / 2.0)) / (u32::MAX as f64 / 2.0)) as f32)
+                .collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_u64(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[u64], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert u64 to f32
+            let samples: Vec<f32> = data
+                .iter()
+                .map(|&s| {
+                    ((s as f64 - (u64::MAX as f64 / 2.0)) / (u64::MAX as f64 / 2.0)) as f32
+                })
+                .collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_f32(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // f32 samples are already in the correct range (-1.0 to 1.0)
+            let samples: Vec<f32> = data.to_vec();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_stream_f64(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    is_recording: Arc<AtomicBool>,
+    source_sample_rate: u32,
+    source_channels: u16,
+    samples_per_chunk: usize,
+) -> Result<cpal::Stream> {
+    let mut buffer: Vec<f32> = Vec::with_capacity(samples_per_chunk * source_channels as usize * 2);
+    let resampler = if source_sample_rate != TARGET_SAMPLE_RATE {
+        Some(SimpleResampler::new(source_sample_rate, TARGET_SAMPLE_RATE))
+    } else {
+        None
+    };
+
+    let err_fn = |err| error!("Audio stream error: {}", err);
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[f64], _: &cpal::InputCallbackInfo| {
+            if !is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Convert f64 to f32
+            let samples: Vec<f32> = data.iter().map(|&s| s as f32).collect();
+
+            process_audio_samples(
+                samples,
+                source_channels,
+                &mut buffer,
+                samples_per_chunk,
+                &resampler,
+                &audio_tx,
+            );
         },
         err_fn,
         None,
