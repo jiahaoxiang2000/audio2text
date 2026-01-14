@@ -1,16 +1,14 @@
 mod audio;
-mod hotkey;
 mod input;
 mod websocket;
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::signal;
 use tracing::{error, info, warn};
 
 use audio::AudioCapture;
-use hotkey::{HotkeyCommand, HotkeyHandler};
 use input::TextInputHandler;
 use websocket::{AsrClient, AsrEvent};
 
@@ -26,7 +24,7 @@ struct App {
     text_input: TextInputHandler,
     api_key: String,
     current_text: String,
-    audio_tx: Option<mpsc::Sender<Vec<u8>>>,
+    audio_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl App {
@@ -41,19 +39,12 @@ impl App {
         }
     }
 
-    async fn toggle_recording(&mut self) -> Result<()> {
-        match self.state {
-            AppState::Idle => self.start_recording().await,
-            AppState::Recording => self.stop_recording().await,
-        }
-    }
-
     async fn start_recording(&mut self) -> Result<()> {
         info!("Starting recording...");
 
         // Create channels
-        let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(100);
-        let (event_tx, mut event_rx) = mpsc::channel::<AsrEvent>(100);
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AsrEvent>(100);
 
         // Store audio sender for later use
         self.audio_tx = Some(audio_tx.clone());
@@ -63,8 +54,6 @@ impl App {
 
         // Start ASR client
         let api_key = self.api_key.clone();
-        let text_input = self.text_input.clone();
-
         tokio::spawn(async move {
             let mut client = AsrClient::new(api_key);
             if let Err(e) = client.start_recognition(audio_rx, event_tx).await {
@@ -73,37 +62,22 @@ impl App {
         });
 
         // Handle ASR events
-        let current_text = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let current_text_clone = current_text.clone();
-
+        let text_input = self.text_input.clone();
         tokio::spawn(async move {
-            let mut previous_text = String::new();
-
             while let Some(event) = event_rx.recv().await {
                 match event {
                     AsrEvent::TaskStarted => {
                         info!("ASR task started");
                     }
                     AsrEvent::ResultGenerated { text, is_final } => {
-                        let mut current = current_text_clone.lock().await;
-
                         if is_final {
-                            // Final result - append to current text
-                            if !current.is_empty() && !text.is_empty() {
-                                current.push(' ');
-                            }
-                            current.push_str(&text);
-
                             // Type the final text
                             if let Err(e) = text_input.type_text(&text) {
                                 error!("Failed to type text: {}", e);
                             }
-
-                            previous_text = current.clone();
                             info!("Final: {}", text);
                         } else {
-                            // Partial result - update display
-                            // For partial results, we show them but don't type yet
+                            // Partial result
                             info!("Partial: {}", text);
                         }
                     }
@@ -120,7 +94,7 @@ impl App {
         });
 
         self.state = AppState::Recording;
-        info!("Recording started. Press Super+I to stop.");
+        info!("Recording started. Press Ctrl+C to stop.");
 
         Ok(())
     }
@@ -165,8 +139,7 @@ async fn main() -> Result<()> {
         .context("DASHSCOPE_API_KEY environment variable not set")?;
 
     info!("Audio2Text - Real-time speech recognition");
-    info!("Press Super+I to start/stop recording");
-    info!("Press Ctrl+C to exit");
+    info!("Press Ctrl+C to stop recording and exit");
 
     // Check for required tools
     check_dependencies();
@@ -174,55 +147,34 @@ async fn main() -> Result<()> {
     // Create app
     let app = Arc::new(tokio::sync::Mutex::new(App::new(api_key)));
 
-    // Create command channel
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<HotkeyCommand>(10);
-
-    // Setup hotkey handler
-    let hotkey_handler = HotkeyHandler::new()?;
-
-    // Spawn hotkey listener
-    let hotkey_handle = tokio::spawn(async move {
-        if let Err(e) = hotkey_handler.run(cmd_tx).await {
-            error!("Hotkey handler error: {}", e);
-        }
-    });
-
     // Handle shutdown signal
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
 
+    // Spawn a separate task for Ctrl+C handling
+    // We don't move app into this task to avoid Send issues
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        signal::ctrl_c().await.ok();
         info!("\nShutting down...");
         running_clone.store(false, Ordering::SeqCst);
     });
 
-    // Main event loop
-    while running.load(Ordering::SeqCst) {
-        tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    HotkeyCommand::ToggleRecording => {
-                        let mut app = app.lock().await;
-                        if let Err(e) = app.toggle_recording().await {
-                            error!("Failed to toggle recording: {}", e);
-                        }
-                    }
-                }
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                // Periodic check
-            }
-        }
+    // Start recording immediately
+    {
+        let mut app = app.lock().await;
+        app.start_recording().await?;
     }
 
-    // Cleanup
+    // Wait for shutdown
+    while running.load(Ordering::SeqCst) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    // Stop recording if active
     let mut app = app.lock().await;
     if app.state == AppState::Recording {
-        app.stop_recording().await?;
+        let _ = app.stop_recording().await;
     }
-
-    hotkey_handle.abort();
 
     info!("Goodbye!");
     Ok(())

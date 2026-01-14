@@ -14,8 +14,6 @@ futures-util = "0.3"
 # Audio capture
 cpal = "0.15"
 
-# Global hotkey
-global-hotkey = "0.6"
 
 # Text input simulation (virtual keyboard for Wayland)
 # Using wl-clipboard and ydotool for Wayland compatibility
@@ -42,8 +40,6 @@ dotenvy = "0.15"
 # Ringbuffer for audio
 ringbuf = "0.4"
 
-# Channel for hotkey events
-crossbeam-channel = "0.5"
 
 # HTTP types for WebSocket
 http = "1"
