@@ -80,6 +80,8 @@ pub struct Parameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vocabulary_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub translation_target_languages: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcription_enabled: Option<bool>,
@@ -158,6 +160,7 @@ impl AsrClient {
                     format: Some("pcm".to_string()),
                     sample_rate: Some(16000),
                     vocabulary_id: None,
+                    language: Some("en".to_string()),
                     transcription_enabled: Some(true),
                     translation_enabled: Some(false),
                     translation_target_languages: None,
