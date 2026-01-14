@@ -4,7 +4,7 @@ description: A comprehensive guide to Audio2Text, a real-time Chinese-to-English
 date: 2026-01-14
 author: isomo
 tags: [audio2text, ai-workflow]
-video: ""
+video: "https://www.bilibili.com/video/BV1uErWBXESE/"
 ---
 
 # Introducing Audio2Text: A Real-Time Speech-to-Text Workflow Enhancement Tool
