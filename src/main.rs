@@ -5,6 +5,7 @@ mod websocket;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tracing::{error, info, warn};
 
@@ -18,6 +19,9 @@ enum AppState {
     Recording,
 }
 
+/// Maximum silence duration before auto-stop (60 seconds of no speech detected by ASR)
+const MAX_SILENCE_SECONDS: u64 = 60;
+
 struct App {
     state: AppState,
     audio_capture: AudioCapture,
@@ -25,6 +29,7 @@ struct App {
     api_key: String,
     current_text: String,
     audio_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    last_asr_result: Arc<AtomicBool>,
 }
 
 impl App {
@@ -36,18 +41,25 @@ impl App {
             api_key,
             current_text: String::new(),
             audio_tx: None,
+            last_asr_result: Arc::new(AtomicBool::new(false)),
         }
     }
 
     async fn start_recording(&mut self) -> Result<()> {
         info!("Starting recording...");
 
+        // Reset ASR result flag
+        self.last_asr_result.store(false, Ordering::SeqCst);
+
         // Create channels
         let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AsrEvent>(100);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<AsrEvent>(100);
 
         // Store audio sender for later use
         self.audio_tx = Some(audio_tx.clone());
+
+        // Share the ASR result flag with the event handler
+        let last_asr_result = self.last_asr_result.clone();
 
         // Start audio capture
         self.audio_capture.start(audio_tx)?;
@@ -61,15 +73,19 @@ impl App {
             }
         });
 
-        // Handle ASR events
+        // Handle ASR events in a separate task
         let text_input = self.text_input.clone();
         tokio::spawn(async move {
+            let mut event_rx = event_rx;
             while let Some(event) = event_rx.recv().await {
                 match event {
                     AsrEvent::TaskStarted => {
                         info!("ASR task started");
                     }
                     AsrEvent::ResultGenerated { text, is_final } => {
+                        // Update flag when we receive any ASR result (speech detected)
+                        last_asr_result.store(true, Ordering::SeqCst);
+
                         if is_final {
                             // Type the final text
                             if let Err(e) = text_input.type_text(&text) {
@@ -94,7 +110,8 @@ impl App {
         });
 
         self.state = AppState::Recording;
-        info!("Recording started. Press Ctrl+C to stop.");
+        info!("Recording started. Will auto-stop after {} seconds of silence.", MAX_SILENCE_SECONDS);
+        info!("Press Ctrl+C to stop manually.");
 
         Ok(())
     }
@@ -112,6 +129,15 @@ impl App {
 
         info!("Recording stopped.");
         Ok(())
+    }
+
+    /// Check if ASR has detected any speech since the last check
+    fn check_and_reset_asr_result(&self) -> bool {
+        let result = self.last_asr_result.load(Ordering::SeqCst);
+        if result {
+            self.last_asr_result.store(false, Ordering::SeqCst);
+        }
+        result
     }
 }
 
@@ -139,7 +165,8 @@ async fn main() -> Result<()> {
         .context("DASHSCOPE_API_KEY environment variable not set")?;
 
     info!("Audio2Text - Real-time speech recognition");
-    info!("Press Ctrl+C to stop recording and exit");
+    info!("Will auto-stop after {} seconds of silence (no speech detected).", MAX_SILENCE_SECONDS);
+    info!("Press Ctrl+C to stop manually.");
 
     // Check for required tools
     check_dependencies();
@@ -152,7 +179,6 @@ async fn main() -> Result<()> {
     let running_clone = running.clone();
 
     // Spawn a separate task for Ctrl+C handling
-    // We don't move app into this task to avoid Send issues
     tokio::spawn(async move {
         signal::ctrl_c().await.ok();
         info!("\nShutting down...");
@@ -165,9 +191,38 @@ async fn main() -> Result<()> {
         app.start_recording().await?;
     }
 
-    // Wait for shutdown
+    // Main event loop - monitors for silence timeout
+    let mut last_speech_time = Instant::now();
+    let mut check_interval = tokio::time::interval(Duration::from_millis(100));
+
     while running.load(Ordering::SeqCst) {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        check_interval.tick().await;
+
+        // Check if ASR has detected any speech
+        let has_speech = {
+            let app = app.lock().await;
+            app.check_and_reset_asr_result()
+        };
+
+        if has_speech {
+            last_speech_time = Instant::now();
+        }
+
+        // Check if we've exceeded the silence timeout
+        let silence_duration = last_speech_time.elapsed().as_secs();
+        if silence_duration >= MAX_SILENCE_SECONDS {
+            info!("No speech detected for {} seconds. Auto-stopping...", MAX_SILENCE_SECONDS);
+            running.store(false, Ordering::SeqCst);
+            break;
+        }
+
+        // Optional: Log silence progress every 10 seconds
+        if silence_duration > 0 && silence_duration % 10 == 0 && silence_duration < MAX_SILENCE_SECONDS {
+            let prev_check = last_speech_time.elapsed().as_secs();
+            if prev_check == silence_duration {
+                info!("Silence duration: {} seconds / {} maximum", silence_duration, MAX_SILENCE_SECONDS);
+            }
+        }
     }
 
     // Stop recording if active
