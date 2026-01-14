@@ -160,10 +160,10 @@ impl AsrClient {
                     format: Some("pcm".to_string()),
                     sample_rate: Some(16000),
                     vocabulary_id: None,
-                    language: Some("en".to_string()),
+                    language: None,
                     transcription_enabled: Some(true),
-                    translation_enabled: Some(false),
-                    translation_target_languages: None,
+                    translation_enabled: Some(true),
+                    translation_target_languages: Some(vec!["en".to_string()]),
                 }),
                 input: Some(Input {}),
                 output: None,
@@ -274,7 +274,19 @@ impl AsrClient {
                                 match event_type.as_str() {
                                     "result-generated" => {
                                         if let Some(output) = &event.payload.output {
-                                            if let Some(transcription) = &output.transcription {
+                                            // Prefer translation over transcription
+                                            if !output.translations.is_empty() {
+                                                let translation = &output.translations[0];
+                                                let is_final = translation.sentence_end;
+                                                let text = translation.text.clone();
+                                                debug!(
+                                                    "Translation: {} (final: {})",
+                                                    text, is_final
+                                                );
+                                                let _ = event_tx_clone
+                                                    .send(AsrEvent::ResultGenerated { text, is_final })
+                                                    .await;
+                                            } else if let Some(transcription) = &output.transcription {
                                                 let is_final = transcription.sentence_end;
                                                 let text = transcription.text.clone();
                                                 debug!(
